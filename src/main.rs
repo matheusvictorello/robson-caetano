@@ -41,6 +41,7 @@ enum CommandError {
     MissingUrl(String),
     MissingSource,
     MissingSongbird,
+    InvalidIndex(String),
     JoinError(JoinError),
 }
 
@@ -141,6 +142,75 @@ impl CommonHandler {
         Ok(())
     }
 
+    async fn list(ctx: &Context, guild_id: GuildId, voice_channel_id: ChannelId, msg_channel_id: ChannelId, _args: &str) -> Result<Vec<Option<String>>, CommandError> {
+        let handler = match CommonHandler::get_songbird_handler(ctx, guild_id, voice_channel_id, msg_channel_id).await {
+            Ok(handler) => {
+                handler
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
+
+        let current_queue: Vec<Option<String>> = {
+            let handler = handler.lock().await;
+
+            let current_queue = handler.queue().current_queue();
+
+            current_queue
+                .iter()
+                .map(|track_handle| track_handle.metadata())
+                .map(|metadata| {
+                    metadata
+                        .title
+                        .clone()
+                })
+                .collect()
+        };
+
+        Ok(current_queue)
+    }
+
+    async fn delete(ctx: &Context, guild_id: GuildId, voice_channel_id: ChannelId, msg_channel_id: ChannelId, args: &str) -> Result<Option<String>, CommandError> {
+        let handler = match CommonHandler::get_songbird_handler(ctx, guild_id, voice_channel_id, msg_channel_id).await {
+            Ok(handler) => {
+                handler
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
+
+        let Ok(idx) = args.parse::<usize>() else {
+            return Err(CommandError::InvalidIndex(args.to_string()));
+        };
+
+        let title = {
+            let handler = handler.lock().await;
+
+            let queue = handler.queue();
+
+            if idx == 0 {
+                queue
+                    .current()
+                    .map(|current| current.stop());
+            }
+
+            let queued = queue.dequeue(idx);
+
+            queued
+                .and_then(|queued| {
+                    queued
+                        .handle()
+                        .metadata()
+                        .title
+                        .clone()
+                })
+        };
+
+        Ok(title)
+    }
+
     async fn solve_url(args: &str) -> Option<Url> {
         if let Ok(url) = Url::parse(args) {
             return Some(url);
@@ -206,7 +276,15 @@ impl CommonHandler {
     }
 
     async fn get_source(url: Url) -> Option<Restartable> {
-        Restartable::ytdl(url, true).await.ok()
+        match Restartable::ytdl(url, true).await {
+            Ok(source) => {
+                Some(source)
+            }
+            Err(err) => {
+                println!("err {:?}", err);
+                None
+            }
+        }
     }
 
     async fn search(query: &str, idx: usize) -> Option<Url> {
@@ -360,6 +438,52 @@ impl EventHandler for CommonHandler {
             "stop" => {
                 CommonHandler::stop(&ctx, guild_id, voice_channel_id, msg.channel_id, args).await
             }
+            "list" => {
+                match CommonHandler::list(&ctx, guild_id, voice_channel_id, msg.channel_id, args).await {
+                    Ok(current_queue) => {
+                        let list_msg = current_queue
+                            .into_iter()
+                            .enumerate()
+                            .map(|(idx, title)| {
+                                let title = title.unwrap_or(String::from(":pinching_hand:"));
+                                format!("**{}.** {}", idx, title)
+                            })
+                            .collect::<Vec<String>>()
+                            .join("\n");
+                        
+                        check_msg(
+                            msg
+                                .channel_id
+                                .say(&ctx.http, &format!("**Lembra não?**\n{}", list_msg))
+                                .await
+                        );
+
+                        Ok(())
+                    }
+                    Err(err) => {
+                        Err(err)
+                    }
+                }
+            }
+            "delete" => {
+                match CommonHandler::delete(&ctx, guild_id, voice_channel_id, msg.channel_id, args).await {
+                    Ok(title) => {
+                        let title = title.unwrap_or(String::from(":pinching_hand:"));
+                        
+                        check_msg(
+                            msg
+                                .channel_id
+                                .say(&ctx.http, &format!("\"{}\" **foi de base**", title))
+                                .await
+                        );
+
+                        Ok(())
+                    }
+                    Err(err) => {
+                        Err(err)
+                    }
+                }
+            }
             cmd => {
                 Err(CommandError::InvalidCommand(cmd.to_string()))
             }
@@ -378,6 +502,9 @@ impl EventHandler for CommonHandler {
                 }
                 CommandError::MissingSongbird => {
                     format!("Deu um biricutico aqui, reclame com o DEV")
+                }
+                CommandError::InvalidIndex(index) => {
+                    format!("1, 2, 3, \"{}\"... boua", index)
                 }
                 CommandError::JoinError(join_error) => {
                     println!("JoinError {:?}", join_error);
